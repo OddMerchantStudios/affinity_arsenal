@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Affinity Arsenal</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <h1>Affinity Arsenal</h1>
+    <div id="global-controls">
+      <button id="pause-btn" class="ctrl-btn">Pause</button>
+      <select id="speed-select" class="ctrl-btn">
+        <option value="1">1x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
+      <button id="reset-btn" class="ctrl-btn danger">Reset</button>
+      <button id="help-btn" class="ctrl-btn">?</button>
+    </div>
+  </header>
+
+  <div id="main-layout">
+
+    <aside id="left-sidebar">
+      <section class="player-card" id="card-p2" data-player="p2">
+        <div class="card-header">
+          <span class="player-label p2">P2</span>
+        </div>
+        <div class="stat energy">
+          <span class="stat-label">Energy</span>
+          <div class="bar energy-bar"><div class="bar-fill" id="p2-energy-fill"></div></div>
+          <span class="stat-value" id="p2-energy-text">0/0</span>
+        </div>
+        <div class="research-flag" id="p2-research-flag">Research: none</div>
+        <div class="category-list" id="toolbar-p2"></div>
+        <div class="tool-info" id="toolinfo-p2"></div>
+        <div class="card-actions" id="card-actions-p2"></div>
+      </section>
+
+      <section class="player-card" id="card-p1" data-player="p1">
+        <div class="card-header">
+          <span class="player-label p1">P1</span>
+        </div>
+        <div class="stat energy">
+          <span class="stat-label">Energy</span>
+          <div class="bar energy-bar"><div class="bar-fill" id="p1-energy-fill"></div></div>
+          <span class="stat-value" id="p1-energy-text">0/0</span>
+        </div>
+        <div class="research-flag" id="p1-research-flag">Research: none</div>
+        <div class="category-list" id="toolbar-p1"></div>
+        <div class="tool-info" id="toolinfo-p1"></div>
+        <div class="card-actions" id="card-actions-p1"></div>
+      </section>
+    </aside>
+
+    <div id="board-wrap">
+      <div class="board" id="board"></div>
+    </div>
+
+    <aside id="inspector">
+      <h2>Inspector</h2>
+      <div id="inspector-body">
+        <p class="hint">Click a build option, then click an empty tile on <em>your own</em> side to place it. Click an existing tile to inspect, upgrade, repair or deconstruct it. Click a locked (🔒) tile to unlock it for 25⚡.</p>
+      </div>
+    </aside>
+
+  </div>
+
+  <div id="game-over-overlay" class="hidden">
+    <div id="game-over-box">
+      <h2 id="game-over-title">Game Over</h2>
+      <button id="game-over-reset" class="ctrl-btn">Play Again</button>
+    </div>
+  </div>
+
+  <div id="tech-tree-overlay" class="hidden">
+    <div id="tech-tree-panel"></div>
+  </div>
+
+  <div id="toast-layer"></div>
+
+  <div id="help-overlay" class="hidden">
+    <div id="help-box">
+      <h2>How to play</h2>
+      <ul>
+        <li>Each side has a <b>Core</b> (the row of tiles at the far edge of the board, 1000 HP) — click it to inspect it. If its HP hits 0, that player loses. It passively generates +2⚡/s on its own; <b>Generators</b> add more (+2/+4/+6⚡/s by tier), and <b>Energy Storage</b> raises your energy cap (+80/+150/+250⚡ by tier, on top of the 150⚡ base cap).</li>
+        <li>You only start with 1 buildable row per side (the one next to your Core) — 4 rows total. Click a locked (🔒) tile to permanently unlock it for 25⚡, one tile at a time.</li>
+        <li>Pick a build option from a player's card on the left, then click an empty tile on <em>that player's own, unlocked</em> side to place it. Placing costs energy up front; the tile's HP starts at 0 and rises to full as it finishes building, so it can be destroyed (losing everything spent on it) if it's hit before construction completes.</li>
+        <li><b>Walls</b>: Wood (150 HP, 20⚡), Stone (320 HP, 30⚡, needs Armor T1), Metal (560 HP, 55⚡, needs Armor T2), Mirror (480 HP, 90⚡, needs Armor T3). A turret can be mounted on any wall.</li>
+        <li><b>Bullet turrets</b> deal only 3–6% of their damage to Stone/Metal/Mirror walls (50% to Wood) — good for chipping unarmored targets and shooting down incoming rockets, not for breaching walls. <b>Rocket turrets</b> deal 70–100% of their damage to any wall. <b>Laser turrets</b> charge, then beam for a fixed duration before cooling down — see the Mirror Wall bullet below for what happens when a laser or Ion Cannon hits one.</li>
+        <li>Each shot (or second of beam) costs energy — if you run dry, turrets pause firing until energy recovers. Hold an individual turret's fire from its inspector panel, or hold every turret on a side at once with <b>Hold All Fire</b>. Holding fire doesn't stop a turret from charging up — a bullet/rocket turret's cooldown keeps ticking and a laser keeps charging, so releasing the hold fires (almost) instantly instead of making you wait out a full cycle.</li>
+        <li>Higher turret tiers fire faster (not harder) — watch the rate and bullet color change, and the tier chevrons on the tile.</li>
+        <li>A <b>Mirror Wall</b>, while active (not mid-construction), reflects 50% of an incoming laser or Ion Cannon tick straight back at the shooter — costing the DEFENDER 0.5⚡ per point of damage reflected. The other 50% of the tick still hits the wall normally. If the defender can't afford that energy cost, the reflect doesn't happen and the wall just takes the full hit like any other material.</li>
+        <li>An <b>Ion Cannon</b> (unlocked via Firepower T3 in the Tech Tree) has no automatic cutoff — once started, it fires every tick, draining energy, until you stop it yourself or run out of energy. Each <b>Amplifier Mirror</b> on one of the 8 tiles touching it (including diagonals) adds +20% damage, stacking — a full ring of 8 is +160%.</li>
+        <li>A <b>Research Lab</b> only unlocks a branching <b>Tech Tree</b> — select it and click <b>Open Tech Tree</b> for the full view — it never grants anything by itself. Research Rate from every active Lab you own ADDS TOGETHER (a Tier 1/2/3 Lab is 1.0/1.6/2.2) to advance your one active project at that many seconds of progress per real second. Only one node researches at a time; switching nodes abandons all progress on the old one. Destroying an active Lab removes 8 seconds of progress per point of Research Rate it had. A Lab with no project selected flashes red on the board.</li>
+        <li>Build options are grouped into categories in the sidebar (Walls, Turrets, Energy, Utility, Advanced) — click a category to expand it. Once a tech node is researched, you can build the tier it unlocks directly from scratch instead of upgrading step by step: it costs the same total energy but takes longer to finish, trading build time for fewer clicks.</li>
+        <li>Click an existing tile to <b>Upgrade</b>, <b>Repair</b>, or <b>Deconstruct</b> it (deconstructing refunds 75% of what you spent, but takes a couple seconds). Upgrading isn't instant either — it costs energy up front, then takes time to complete (shown as a progress bar on the tile itself), though the tile keeps working normally at its current tier the whole time. An in-progress upgrade can be cancelled for a full refund.</li>
+        <li>Toggle <b>Auto-Repair</b> per player to slowly heal damaged structures (12 HP/s budget, 0.5⚡ per HP) for a steady energy drain.</li>
+      </ul>
+      <button id="help-close" class="ctrl-btn">Close</button>
+    </div>
+  </div>
+
+  <div id="start-overlay">
+    <div id="start-box">
+      <h2>Affinity Arsenal</h2>
+      <p>Two cores. Build walls, turrets, generators and research on your own side, defend your core, and destroy theirs. Playable hotseat — build on either side.</p>
+      <button id="start-btn" class="ctrl-btn">Start Game</button>
+    </div>
+  </div>
+
+  <div id="countdown-overlay" class="hidden">
+    <div id="countdown-number">3</div>
+  </div>
+
+</div>
+<script src="game.js"></script>
+</body>
+</html>
