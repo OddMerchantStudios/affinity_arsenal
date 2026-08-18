@@ -3606,6 +3606,80 @@ $('game-over-reset').addEventListener('click', () => {
 $('help-btn').addEventListener('click', () => $('help-overlay').classList.remove('hidden'));
 $('help-close').addEventListener('click', () => $('help-overlay').classList.add('hidden'));
 
+/* ======================= TUTORIAL ======================= */
+// Deliberately short - five steps just covering the mechanics a first-time player needs to get
+// moving (build, place, upgrade, research). Anything more detailed already lives in the Help (?)
+// reference panel, which stays untouched for that job.
+const TUTORIAL_STEPS = [
+  {
+    icon: '🎯',
+    title: 'The Goal',
+    html: `Two <b>Cores</b> face off across a neutral zone. Defend yours, destroy theirs.
+      You only start with one buildable row next to your Core — click a locked (🔒) tile
+      to unlock the rest, one at a time.`,
+  },
+  {
+    icon: '🏗️',
+    title: 'Building Types',
+    html: `Your sidebar groups everything into categories: <b>Walls</b> (block and soak damage),
+      <b>Turrets</b> (mount on a wall, fire automatically), <b>Energy</b> (Generators &amp; Storage),
+      <b>Utility</b> (Research Lab, Auto-Repair) and <b>Advanced</b> (Ion Cannon, Amplifier Mirror).
+      Everything costs energy, which your Core and Generators produce over time.`,
+  },
+  {
+    icon: '📍',
+    title: 'Placing a Tile',
+    html: `Click a category to expand it, pick a build option, then click an empty, unlocked
+      tile on <b>your own</b> side. It costs energy immediately and takes a few seconds to
+      finish — an unfinished tile is fragile, so don't leave it exposed.`,
+  },
+  {
+    icon: '⬆️',
+    title: 'Upgrading &amp; Repairing',
+    html: `Click any built tile to inspect it. <b>Upgrade</b> raises it a tier for more HP/damage —
+      it costs energy and takes time, but the tile keeps working at its current tier the whole
+      way through. <b>Repair</b> tops off lost HP, or flip on <b>Auto-Repair</b> to do it hands-free.`,
+  },
+  {
+    icon: '🔬',
+    title: 'The Tech Tree',
+    html: `Build a <b>Research Lab</b>, then open its Tech Tree from the inspector and pick ONE
+      project. Your labs' combined research rate advances it over time; finishing a node unlocks
+      stronger walls, turrets and more.`,
+  },
+];
+
+let tutorialStep = 0;
+
+function renderTutorialStep() {
+  const step = TUTORIAL_STEPS[tutorialStep];
+  $('tutorial-step-label').textContent = `Step ${tutorialStep + 1} of ${TUTORIAL_STEPS.length}`;
+  $('tutorial-icon').textContent = step.icon;
+  $('tutorial-title').innerHTML = step.title;
+  $('tutorial-text').innerHTML = step.html;
+  $('tutorial-dots').innerHTML = TUTORIAL_STEPS
+    .map((_, i) => `<span class="dot${i === tutorialStep ? ' active' : ''}"></span>`)
+    .join('');
+  $('tutorial-prev').disabled = tutorialStep === 0;
+  $('tutorial-next').textContent = tutorialStep === TUTORIAL_STEPS.length - 1 ? 'Got it!' : 'Next';
+}
+
+function openTutorial() {
+  tutorialStep = 0;
+  renderTutorialStep();
+  $('tutorial-overlay').classList.remove('hidden');
+}
+
+$('tutorial-btn').addEventListener('click', openTutorial);
+$('tutorial-close').addEventListener('click', () => $('tutorial-overlay').classList.add('hidden'));
+$('tutorial-prev').addEventListener('click', () => {
+  if (tutorialStep > 0) { tutorialStep -= 1; renderTutorialStep(); }
+});
+$('tutorial-next').addEventListener('click', () => {
+  if (tutorialStep < TUTORIAL_STEPS.length - 1) { tutorialStep += 1; renderTutorialStep(); }
+  else $('tutorial-overlay').classList.add('hidden');
+});
+
 // Clicking the dimmed backdrop (anywhere that isn't the panel itself) closes the Tech Tree,
 // same convention as the category flyouts dismissing on an outside click.
 $('tech-tree-overlay').addEventListener('click', (e) => {
