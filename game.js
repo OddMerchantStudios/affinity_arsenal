@@ -352,20 +352,56 @@ function isTurretKind(kind) { return Object.prototype.hasOwnProperty.call(TURRET
 // simulation itself (see fireTurret et al.), not derived from persisted state, so they don't
 // currently reach the guest - the guest still sees every HP/energy/build outcome update live,
 // just without the flying-bullet/laser flourish while it happens.
+// Two data channels per connection, not one:
+//  - `conn` is the default reliable/ordered WebRTC data channel - used for the rare messages
+//    that MUST all arrive, in order (build/upgrade actions, start, reset).
+//  - `streamConn` is an explicitly unreliable, unordered channel (ordered:false,
+//    maxRetransmits:0) - used only for the full state snapshot and ambient fx pings that fire
+//    many times a second. Those are "latest wins" by nature (each snapshot supersedes the last),
+//    so losing one is a non-event - but on a reliable/ordered channel, the WebRTC stack has to
+//    retransmit and redeliver every lost packet IN ORDER before anything newer can arrive, and
+//    we were producing a new one every 50ms regardless of whether the last one had gotten
+//    through yet. On a real long-distance/lossy link that backlog only grows, and what should be
+//    a live game turns into replaying several minutes of queued-up history. Splitting the
+//    frequent, disposable traffic onto its own unreliable channel means a lost snapshot is just
+//    skipped, not queued.
 const net = {
   active: false,      // true once this game is being played over a connection (host or guest)
   role: null,          // 'host' | 'guest'
   myPlayerKey: null,   // which side THIS browser controls - 'p1' for host, 'p2' for guest
   peer: null,          // PeerJS Peer instance
-  conn: null,          // PeerJS DataConnection
-  connected: false,
+  conn: null,          // reliable/ordered channel - actions, start, reset
+  streamConn: null,    // unreliable/unordered channel - state snapshots, ambient fx
+  connReady: false,
+  streamReady: false,
+  connected: false,    // true once BOTH channels are open
 };
 
-const NET_SNAPSHOT_INTERVAL = 1 / 20; // host -> guest state sync rate
+// Google's STUN server (PeerJS's own default) only helps two peers discover each other's public
+// address - it does nothing when a direct peer-to-peer route isn't possible at all (symmetric
+// NAT, restrictive corporate/campus firewalls, some mobile carriers), which is a plausible reason
+// a connection between distant/differently-networked players ends up degraded rather than clean.
+// The Open Relay Project's TURN servers are added as a fallback relay for exactly that case -
+// free, public, no signup: https://www.metered.ca/tools/openrelay/
+const ICE_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  ],
+};
+
+const NET_SNAPSHOT_INTERVAL = 1 / 15; // host -> guest state sync rate
 let netSnapshotAccum = 0;
 
 function netSend(msg) {
-  if (net.conn && net.connected) net.conn.send(msg);
+  if (net.conn && net.connReady) net.conn.send(msg);
+}
+
+function netSendStream(msg) {
+  if (net.streamConn && net.streamReady) net.streamConn.send(msg);
 }
 
 // One-off ambient VFX (the "+2⚡" that pops off a generator, "+0.4🔬" off a lab, "+6❤" off
@@ -374,8 +410,8 @@ function netSend(msg) {
 // heartbeat. These fire at most once per second per tile, so it's cheap to mirror as its own
 // small message rather than folding it into the state snapshot.
 function netFx(playerKey, d, c, text, cssClass, pulseClass) {
-  if (net.active && net.role === 'host' && net.connected) {
-    netSend({ t: 'fx', playerKey, d, c, text, cssClass, pulseClass });
+  if (net.active && net.role === 'host' && net.streamReady) {
+    netSendStream({ t: 'fx', playerKey, d, c, text, cssClass, pulseClass });
   }
 }
 
@@ -532,28 +568,37 @@ function handleNetMessage(msg) {
   }
 }
 
-function setConnectionHandlers(conn) {
+// Called once per channel as it opens/closes - recomputes the combined `net.connected` (both
+// channels up) and lets the caller react to a drop (e.g. show a toast) exactly once rather than
+// once per channel.
+function onChannelStateChange(onDrop) {
+  const wasConnected = net.connected;
+  net.connected = net.connReady && net.streamReady;
+  if (wasConnected && !net.connected && onDrop) onDrop();
+  updateOnlineUI();
+}
+
+function setupCtrlConn(conn) {
   net.conn = conn;
-  conn.on('open', () => {
-    net.connected = true;
-    updateOnlineUI();
-  });
+  conn.on('open', () => { net.connReady = true; onChannelStateChange(); });
   conn.on('data', (msg) => { try { handleNetMessage(msg); } catch (e) { console.error('[online] bad message', e); } });
-  conn.on('close', () => {
-    net.connected = false;
-    showToast('Connection to your friend was lost.');
-    updateOnlineUI();
-  });
-  conn.on('error', (err) => {
-    console.error('[online]', err);
-  });
+  conn.on('close', () => { net.connReady = false; onChannelStateChange(() => showToast('Connection to your friend was lost.')); });
+  conn.on('error', (err) => console.error('[online]', err));
+}
+
+function setupStreamConn(conn) {
+  net.streamConn = conn;
+  conn.on('open', () => { net.streamReady = true; onChannelStateChange(); });
+  conn.on('data', (msg) => { try { handleNetMessage(msg); } catch (e) { console.error('[online] bad message', e); } });
+  conn.on('close', () => { net.streamReady = false; onChannelStateChange(() => showToast('Connection to your friend was lost.')); });
+  conn.on('error', (err) => console.error('[online]', err));
 }
 
 function startHosting() {
   net.role = 'host';
   net.myPlayerKey = 'p1';
   net.active = true;
-  const peer = new Peer();
+  const peer = new Peer({ config: ICE_CONFIG });
   net.peer = peer;
   peer.on('open', (id) => {
     const link = `${location.origin}${location.pathname}?join=${id}`;
@@ -562,8 +607,13 @@ function startHosting() {
     setOnlineStatus('online-status', `Waiting for a connection… (room code: ${id})`, '');
   });
   peer.on('connection', (conn) => {
-    if (net.conn) { conn.close(); return; } // MVP: one guest at a time
-    setConnectionHandlers(conn);
+    if (conn.label === 'stream') {
+      if (net.streamConn) { conn.close(); return; } // MVP: one guest at a time
+      setupStreamConn(conn);
+    } else {
+      if (net.conn) { conn.close(); return; }
+      setupCtrlConn(conn);
+    }
   });
   peer.on('error', (err) => {
     console.error('[online]', err);
@@ -591,12 +641,11 @@ function startJoining(rawIdOrLink) {
   buildBoard(true); // guest always sees their own side (p2) at the bottom, like chess.com
   fitBoard();
   setOnlineStatus('online-join-status', 'Connecting…', '');
-  const peer = new Peer();
+  const peer = new Peer({ config: ICE_CONFIG });
   net.peer = peer;
   peer.on('open', () => {
-    const conn = peer.connect(hostId, { reliable: true });
-    conn.on('open', () => setOnlineStatus('online-join-status', 'Connected! Waiting for host to start…', 'connected'));
-    setConnectionHandlers(conn);
+    setupCtrlConn(peer.connect(hostId, { label: 'ctrl', reliable: true, ordered: true }));
+    setupStreamConn(peer.connect(hostId, { label: 'stream', reliable: false, ordered: false, maxRetransmits: 0 }));
   });
   peer.on('error', (err) => {
     console.error('[online]', err);
@@ -607,8 +656,10 @@ function startJoining(rawIdOrLink) {
 function teardownNetworking() {
   const wasFlipped = net.myPlayerKey === 'p2';
   if (net.conn) { try { net.conn.close(); } catch (e) { /* ignore */ } }
+  if (net.streamConn) { try { net.streamConn.close(); } catch (e) { /* ignore */ } }
   if (net.peer) { try { net.peer.destroy(); } catch (e) { /* ignore */ } }
-  net.active = false; net.role = null; net.myPlayerKey = null; net.peer = null; net.conn = null; net.connected = false;
+  net.active = false; net.role = null; net.myPlayerKey = null; net.peer = null;
+  net.conn = null; net.streamConn = null; net.connReady = false; net.streamReady = false; net.connected = false;
   document.body.dataset.lockedSide = '';
   if (wasFlipped) { buildBoard(false); fitBoard(); }
 }
@@ -643,6 +694,8 @@ function updateOnlineUI() {
 
   if (net.role === 'host' && net.connected) {
     setOnlineStatus('online-status', "Connected! Click Start Game whenever you're ready.", 'connected');
+  } else if (net.role === 'guest' && net.connected) {
+    setOnlineStatus('online-join-status', 'Connected! Waiting for host to start…', 'connected');
   }
 
   const guestActive = net.active && net.role === 'guest';
@@ -3412,11 +3465,11 @@ function frame(ts) {
     tick(dt * state.speed);
   }
 
-  if (net.active && net.role === 'host' && net.connected) {
+  if (net.active && net.role === 'host' && net.streamReady) {
     netSnapshotAccum += dt;
     if (netSnapshotAccum >= NET_SNAPSHOT_INTERVAL) {
       netSnapshotAccum = 0;
-      netSend(buildSnapshot());
+      netSendStream(buildSnapshot());
     }
   }
 
