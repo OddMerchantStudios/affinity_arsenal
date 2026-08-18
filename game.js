@@ -332,10 +332,303 @@ const state = {
   speed: 1,
   lastTime: null,
   gameOver: false,
+  vsCpu: false,          // single-player mode - state.cpuPlayer is driven by runCpuTurn instead of clicks
+  cpuPlayer: 'p2',
+  cpuDifficulty: 'normal',
+  aiTimer: 0,
 };
 
 function otherKey(key) { return key === 'p1' ? 'p2' : 'p1'; }
 function isTurretKind(kind) { return Object.prototype.hasOwnProperty.call(TURRET_KINDS, kind); }
+
+/* ======================= ONLINE MULTIPLAYER ======================= */
+// Host runs the real simulation (tick/tickPlayer) exactly like local hotseat play always has -
+// the only difference online is that P2's clicks arrive over a WebRTC data channel (PeerJS)
+// instead of the mouse, and the resulting state gets snapshotted back to the guest to render.
+// The guest's browser never calls tick() itself - true peer-to-peer simulation would need the
+// sim to be bit-for-bit deterministic (seeded RNG, fixed timestep) to keep both screens agreeing
+// on who's winning, which this codebase isn't built for (plain Math.random(), wall-clock dt).
+// Known MVP gap: projectile/beam animations are fired as one-off DOM effects from inside the
+// simulation itself (see fireTurret et al.), not derived from persisted state, so they don't
+// currently reach the guest - the guest still sees every HP/energy/build outcome update live,
+// just without the flying-bullet/laser flourish while it happens.
+const net = {
+  active: false,      // true once this game is being played over a connection (host or guest)
+  role: null,          // 'host' | 'guest'
+  myPlayerKey: null,   // which side THIS browser controls - 'p1' for host, 'p2' for guest
+  peer: null,          // PeerJS Peer instance
+  conn: null,          // PeerJS DataConnection
+  connected: false,
+};
+
+const NET_SNAPSHOT_INTERVAL = 1 / 20; // host -> guest state sync rate
+let netSnapshotAccum = 0;
+
+function netSend(msg) {
+  if (net.conn && net.connected) net.conn.send(msg);
+}
+
+// --- snapshot (host's authoritative gameplay state -> guest's mirror) ---
+// Deliberately hand-rolled rather than JSON.stringify(state.players) - a turret mid-beam holds a
+// live DOM node (cell.turret.beamEl, see makeEmptyCell's comment) which isn't serializable, and
+// this also lets the wire format skip the local-only UI fields (armed/selected/expandedCategory).
+function serializeCell(cell) {
+  return {
+    type: cell.type, tier: cell.tier, hp: cell.hp, maxHp: cell.maxHp, status: cell.status,
+    progress: cell.progress, totalTime: cell.totalTime, investedCost: cell.investedCost,
+    unlocked: cell.unlocked,
+    upgrading: cell.upgrading ? { ...cell.upgrading } : null,
+    turret: cell.turret ? {
+      kind: cell.turret.kind, tier: cell.turret.tier, status: cell.turret.status,
+      progress: cell.turret.progress, totalTime: cell.turret.totalTime, investedCost: cell.turret.investedCost,
+      cooldown: cell.turret.cooldown, holdFire: cell.turret.holdFire,
+      beamPhase: cell.turret.beamPhase, beamTimer: cell.turret.beamTimer,
+      upgrading: cell.turret.upgrading ? { ...cell.turret.upgrading } : null,
+    } : null,
+  };
+}
+
+function serializePlayerForNet(p) {
+  return {
+    energy: p.energy, maxEnergy: p.maxEnergy, core: { ...p.core },
+    autoRepair: p.autoRepair, globalHoldFire: p.globalHoldFire,
+    labMaxTier: p.labMaxTier, labUnlockedTier: p.labUnlockedTier,
+    completedResearch: Array.from(p.completedResearch),
+    activeResearchNode: p.activeResearchNode, researchProgress: p.researchProgress,
+    grid: p.grid.map((row) => row.map(serializeCell)),
+  };
+}
+
+function buildSnapshot() {
+  return {
+    t: 'snap',
+    players: { p1: serializePlayerForNet(state.players.p1), p2: serializePlayerForNet(state.players.p2) },
+    gameOver: state.gameOver, paused: state.paused, started: state.started, speed: state.speed,
+  };
+}
+
+function applySnapshot(msg) {
+  ['p1', 'p2'].forEach((k) => {
+    const src = msg.players[k];
+    const dst = state.players[k];
+    dst.energy = src.energy; dst.maxEnergy = src.maxEnergy;
+    dst.core.hp = src.core.hp; dst.core.maxHp = src.core.maxHp;
+    dst.autoRepair = src.autoRepair; dst.globalHoldFire = src.globalHoldFire;
+    dst.labMaxTier = src.labMaxTier; dst.labUnlockedTier = src.labUnlockedTier;
+    dst.completedResearch = new Set(src.completedResearch);
+    dst.activeResearchNode = src.activeResearchNode; dst.researchProgress = src.researchProgress;
+    for (let d = 0; d < GRID_DEPTH; d++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        const sc = src.grid[d][c];
+        const dc = dst.grid[d][c];
+        const keepBeamEl = (dc.turret && sc.turret && dc.turret.kind === sc.turret.kind) ? dc.turret.beamEl : null;
+        if (dc.turret && dc.turret.beamEl && !keepBeamEl) dc.turret.beamEl.remove();
+        Object.assign(dc, sc);
+        dc.turret = sc.turret ? { ...sc.turret, beamEl: keepBeamEl } : null;
+      }
+    }
+  });
+  const justEnded = msg.gameOver && !state.gameOver;
+  state.gameOver = msg.gameOver; state.paused = msg.paused; state.started = msg.started; state.speed = msg.speed;
+  if (justEnded) {
+    const p1Dead = state.players.p1.core.hp <= 0;
+    const p2Dead = state.players.p2.core.hp <= 0;
+    let title;
+    if (p1Dead && p2Dead) title = 'Draw!';
+    else if (p1Dead) title = 'P2 Wins!';
+    else title = 'P1 Wins!';
+    $('game-over-title').textContent = title;
+    $('game-over-overlay').classList.remove('hidden');
+    $('pause-btn').textContent = 'Resume';
+  }
+}
+
+// --- actions (guest's own-side clicks -> host's authoritative mutation) ---
+// Every gameplay mutation a click can trigger is registered here by name, taking the acting
+// player's key plus a small serializable payload. Offline/hotseat/CPU play and the host's own
+// clicks call runAction() and it executes immediately, same as before this existed; a guest's
+// clicks on their own side get sent to the host instead of applied locally, and the host runs
+// the exact same ACTIONS entry when the message arrives.
+function cellAt(playerKey, depth, col) { return state.players[playerKey].grid[depth][col]; }
+
+const ACTIONS = {
+  unlockTile: (playerKey, { depth, col }) => tryUnlockTile(playerKey, depth, col),
+  place: (playerKey, { depth, col, kind, tier }) => tryPlace(playerKey, depth, col, kind, tier),
+  toggleAutoRepair: (playerKey) => { state.players[playerKey].autoRepair = !state.players[playerKey].autoRepair; },
+  toggleGlobalHoldFire: (playerKey) => { state.players[playerKey].globalHoldFire = !state.players[playerKey].globalHoldFire; },
+  cancelConstruction: (playerKey, { depth, col }) => cancelConstruction(state.players[playerKey], cellAt(playerKey, depth, col)),
+  cancelDeconstruct: (playerKey, { depth, col }) => cancelDeconstruct(cellAt(playerKey, depth, col)),
+  startUpgradeBase: (playerKey, { depth, col }) => startUpgradeBase(state.players[playerKey], cellAt(playerKey, depth, col)),
+  cancelUpgradeBase: (playerKey, { depth, col }) => cancelUpgradeBase(state.players[playerKey], cellAt(playerKey, depth, col)),
+  repairBase: (playerKey, { depth, col }) => repairBase(state.players[playerKey], cellAt(playerKey, depth, col)),
+  cancelTurretConstruction: (playerKey, { depth, col }) => cancelTurretConstruction(state.players[playerKey], cellAt(playerKey, depth, col)),
+  cancelTurretDeconstruct: (playerKey, { depth, col }) => cancelTurretDeconstruct(cellAt(playerKey, depth, col)),
+  toggleHoldFire: (playerKey, { depth, col }) => toggleHoldFire(cellAt(playerKey, depth, col)),
+  cancelUpgradeTurret: (playerKey, { depth, col }) => cancelUpgradeTurret(state.players[playerKey], cellAt(playerKey, depth, col)),
+  startUpgradeTurret: (playerKey, { depth, col }) => startUpgradeTurret(state.players[playerKey], cellAt(playerKey, depth, col)),
+  startTurretDeconstruct: (playerKey, { depth, col }) => startTurretDeconstruct(cellAt(playerKey, depth, col)),
+  startDeconstruct: (playerKey, { depth, col }) => startDeconstruct(cellAt(playerKey, depth, col)),
+  selectResearchNode: (playerKey, { nodeId }) => {
+    const player = state.players[playerKey];
+    const node = TECH_TREE[nodeId];
+    if (player.completedResearch.has(nodeId) || player.activeResearchNode === nodeId) return;
+    if (!techPrereqMet(player, node)) return;
+    if (!techLabTierMet(player, node)) return;
+    player.activeResearchNode = nodeId;
+    player.researchProgress = 0;
+  },
+  cancelResearch: (playerKey) => {
+    const player = state.players[playerKey];
+    player.activeResearchNode = null;
+    player.researchProgress = 0;
+  },
+};
+
+function runAction(name, playerKey, payload) {
+  if (net.active && net.role === 'guest') {
+    if (playerKey !== net.myPlayerKey) return;
+    netSend({ t: 'action', name, playerKey, payload: payload || {} });
+    return;
+  }
+  ACTIONS[name](playerKey, payload || {});
+}
+
+function handleNetMessage(msg) {
+  if (net.role === 'host') {
+    if (msg.t === 'action') {
+      const fn = ACTIONS[msg.name];
+      if (fn) { fn(msg.playerKey, msg.payload || {}); renderAll(); }
+    } else if (msg.t === 'requestStart') {
+      // guest can't start; ignored - kept only so a stray message doesn't throw
+    }
+  } else if (net.role === 'guest') {
+    if (msg.t === 'snap') {
+      applySnapshot(msg);
+      renderLive();
+    } else if (msg.t === 'start') {
+      applyLockVisuals();
+      beginCountdown();
+    } else if (msg.t === 'reset') {
+      resetGame();
+    }
+  }
+}
+
+function setConnectionHandlers(conn) {
+  net.conn = conn;
+  conn.on('open', () => {
+    net.connected = true;
+    updateOnlineUI();
+  });
+  conn.on('data', (msg) => { try { handleNetMessage(msg); } catch (e) { console.error('[online] bad message', e); } });
+  conn.on('close', () => {
+    net.connected = false;
+    showToast('Connection to your friend was lost.');
+    updateOnlineUI();
+  });
+  conn.on('error', (err) => {
+    console.error('[online]', err);
+  });
+}
+
+function startHosting() {
+  net.role = 'host';
+  net.myPlayerKey = 'p1';
+  net.active = true;
+  const peer = new Peer();
+  net.peer = peer;
+  peer.on('open', (id) => {
+    const link = `${location.origin}${location.pathname}?join=${id}`;
+    const input = $('online-link-input');
+    if (input) input.value = link;
+    setOnlineStatus('online-status', `Waiting for a connection… (room code: ${id})`, '');
+  });
+  peer.on('connection', (conn) => {
+    if (net.conn) { conn.close(); return; } // MVP: one guest at a time
+    setConnectionHandlers(conn);
+  });
+  peer.on('error', (err) => {
+    console.error('[online]', err);
+    setOnlineStatus('online-status', `Connection error: ${err.type || err.message || err}`, 'error');
+  });
+}
+
+function extractPeerId(raw) {
+  const text = (raw || '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    const fromQuery = url.searchParams.get('join');
+    if (fromQuery) return fromQuery;
+  } catch (e) { /* not a URL - treat as a raw code */ }
+  return text;
+}
+
+function startJoining(rawIdOrLink) {
+  const hostId = extractPeerId(rawIdOrLink);
+  if (!hostId) { setOnlineStatus('online-join-status', 'Paste a valid link or code first.', 'error'); return; }
+  net.role = 'guest';
+  net.myPlayerKey = 'p2';
+  net.active = true;
+  setOnlineStatus('online-join-status', 'Connecting…', '');
+  const peer = new Peer();
+  net.peer = peer;
+  peer.on('open', () => {
+    const conn = peer.connect(hostId, { reliable: true });
+    conn.on('open', () => setOnlineStatus('online-join-status', 'Connected! Waiting for host to start…', 'connected'));
+    setConnectionHandlers(conn);
+  });
+  peer.on('error', (err) => {
+    console.error('[online]', err);
+    setOnlineStatus('online-join-status', `Connection error: ${err.type || err.message || err}`, 'error');
+  });
+}
+
+function teardownNetworking() {
+  if (net.conn) { try { net.conn.close(); } catch (e) { /* ignore */ } }
+  if (net.peer) { try { net.peer.destroy(); } catch (e) { /* ignore */ } }
+  net.active = false; net.role = null; net.myPlayerKey = null; net.peer = null; net.conn = null; net.connected = false;
+  document.body.dataset.lockedSide = '';
+}
+
+function setOnlineStatus(elId, text, cls) {
+  const el = $(elId);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'online-hint' + (cls ? ' ' + cls : '');
+}
+
+// Keeps the start screen in sync with the online panel's state - which of Host/Join is chosen,
+// whether a connection is up yet, and who (if anyone) is allowed to press Start Game.
+function updateOnlineUI() {
+  const panel = $('online-panel');
+  if (!panel) return;
+  const onlineMode = selectedMode === 'online';
+  panel.classList.toggle('hidden', !onlineMode);
+
+  const startBtn = $('start-btn');
+  if (startBtn) {
+    if (!onlineMode) {
+      startBtn.classList.remove('hidden');
+      startBtn.disabled = false;
+    } else if (net.role === 'host') {
+      startBtn.classList.remove('hidden');
+      startBtn.disabled = !net.connected;
+    } else {
+      startBtn.classList.add('hidden'); // guest, or haven't picked Host/Join yet
+    }
+  }
+
+  if (net.role === 'host' && net.connected) {
+    setOnlineStatus('online-status', "Connected! Click Start Game whenever you're ready.", 'connected');
+  }
+
+  const guestActive = net.active && net.role === 'guest';
+  ['pause-btn', 'speed-select', 'reset-btn'].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = guestActive;
+  });
+}
 
 /* ======================= DOM REFS ======================= */
 
@@ -504,8 +797,7 @@ function buildCardActions(playerKey) {
   repairToggle.id = `autorepair-${playerKey}`;
   repairToggle.innerHTML = `<span class="tname"></span>`;
   repairToggle.addEventListener('click', () => {
-    const p = state.players[playerKey];
-    p.autoRepair = !p.autoRepair;
+    runAction('toggleAutoRepair', playerKey);
     renderAll();
   });
   container.appendChild(repairToggle);
@@ -515,8 +807,7 @@ function buildCardActions(playerKey) {
   holdAllBtn.id = `holdall-${playerKey}`;
   holdAllBtn.innerHTML = `<span class="tname"></span>`;
   holdAllBtn.addEventListener('click', () => {
-    const player = state.players[playerKey];
-    player.globalHoldFire = !player.globalHoldFire;
+    runAction('toggleGlobalHoldFire', playerKey);
     renderAll();
   });
   container.appendChild(holdAllBtn);
@@ -766,7 +1057,7 @@ function onCellClick(playerKey, depth, col) {
   const cellEl = cellEls[playerKey][depth][col].root;
 
   if (!cell.unlocked) {
-    tryUnlockTile(playerKey, depth, col);
+    runAction('unlockTile', playerKey, { depth, col });
     renderAll();
     return;
   }
@@ -779,10 +1070,14 @@ function onCellClick(playerKey, depth, col) {
       : cell.type === 'empty';
 
     if (canAttemptHere) {
-      const ok = tryPlace(playerKey, depth, col, kind, tier);
-      if (!ok) {
-        flashInvalid(cellEl);
-        showToast(explainPlacementFailure(playerKey, depth, col, kind, tier));
+      if (net.active && net.role === 'guest') {
+        runAction('place', playerKey, { depth, col, kind, tier });
+      } else {
+        const ok = tryPlace(playerKey, depth, col, kind, tier);
+        if (!ok) {
+          flashInvalid(cellEl);
+          showToast(explainPlacementFailure(playerKey, depth, col, kind, tier));
+        }
       }
       renderAll();
       return;
@@ -1288,6 +1583,31 @@ function spawnBurst(x, y) {
   setTimeout(() => b.remove(), 320);
 }
 
+// Every "producing" structure (generator, research lab, auto-repair) ticks silently in the
+// simulation - these two helpers are the only thing that makes that tick VISIBLE on the board,
+// which is the whole point: the player should be able to read what a tile is doing without
+// opening its inspector, the same way a chess piece's move is legible just by looking at it.
+function spawnFloatText(cellEl, text, cssClass) {
+  if (!boardEl || !bulletLayer || !cellEl) return;
+  const { x, y } = elCenter(cellEl);
+  const el = document.createElement('div');
+  el.className = `float-fx ${cssClass || ''}`;
+  el.textContent = text;
+  el.style.left = x + 'px';
+  el.style.top = y + 'px';
+  bulletLayer.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('rise'));
+  setTimeout(() => el.remove(), 950);
+}
+
+function pulseCell(cellEl, cssClass, ms = 550) {
+  if (!cellEl) return;
+  cellEl.classList.remove(cssClass);
+  void cellEl.offsetWidth; // force reflow so the animation restarts if it's still running
+  cellEl.classList.add(cssClass);
+  setTimeout(() => cellEl.classList.remove(cssClass), ms);
+}
+
 function positionBeamEl(beamEl, fromEl, toEl) {
   const boardRect = boardEl.getBoundingClientRect();
   const fromRect = fromEl.getBoundingClientRect();
@@ -1445,7 +1765,19 @@ function tickPlayer(playerKey, dt) {
       const cell = player.grid[d][c];
       if (cell.status !== 'active') continue;
       if (cell.type === 'generator') {
-        income += TILE_TYPES.generator.tiers[cell.tier - 1].energyRate;
+        const genCfg = TILE_TYPES.generator.tiers[cell.tier - 1];
+        income += genCfg.energyRate;
+
+        // Heartbeat: once per in-game second, pop a "+N⚡" off the generator and give the tile
+        // a soft pulse - the energy was already flowing continuously into the bar, this just
+        // makes that flow readable at a glance instead of a silently ticking number.
+        cell._prodFxT = (cell._prodFxT || 0) + dt;
+        if (cell._prodFxT >= 1) {
+          cell._prodFxT -= 1;
+          const cellEl = cellEls[playerKey][d][c].root;
+          spawnFloatText(cellEl, `+${genCfg.energyRate}⚡`, 'fx-energy');
+          pulseCell(cellEl, 'pulse-energy');
+        }
       } else if (cell.type === 'storage') {
         capacity += TILE_TYPES.storage.tiers[cell.tier - 1].capacityBonus;
       }
@@ -1484,6 +1816,21 @@ function tickPlayer(playerKey, dt) {
       } else if (cell.status === 'active' && cell.upgrading) {
         cell.upgrading.progress -= dt;
         if (cell.upgrading.progress <= 0) finishUpgradeBase(cell);
+      }
+
+      // Same heartbeat idea as generators: an active Lab that's actually contributing to the
+      // player's research (a project is selected) pops its rate once per in-game second. A Lab
+      // with nothing selected already flags itself red via needs-attention in the render pass,
+      // so this only fires on the "working" half of that state.
+      if (cell.type === 'researchLab' && cell.status === 'active' && player.activeResearchNode) {
+        const labCfg = TILE_TYPES.researchLab.tiers[cell.tier - 1];
+        cell._prodFxT = (cell._prodFxT || 0) + dt;
+        if (cell._prodFxT >= 1) {
+          cell._prodFxT -= 1;
+          const cellEl = cellEls[playerKey][d][c].root;
+          spawnFloatText(cellEl, `+${labCfg.researchRate.toFixed(1)}🔬`, 'fx-research');
+          pulseCell(cellEl, 'pulse-research');
+        }
       }
 
       if (cell.type === 'wall' && cell.turret) {
@@ -1552,6 +1899,19 @@ function tickPlayer(playerKey, dt) {
             cell.hp += amt;
             player.energy -= cost;
             budget -= amt;
+
+            // Same once-per-second heartbeat, but the amount is batched: auto-repair can touch
+            // a tile every single frame while it's damaged, and popping a number every frame
+            // would just be noise rather than a readable "it's healing" signal.
+            cell._repairAcc = (cell._repairAcc || 0) + amt;
+            cell._repairFxT = (cell._repairFxT || 0) + dt;
+            if (cell._repairFxT >= 1) {
+              cell._repairFxT -= 1;
+              const cellEl = cellEls[playerKey][d][c].root;
+              spawnFloatText(cellEl, `+${Math.round(cell._repairAcc)}❤`, 'fx-repair');
+              pulseCell(cellEl, 'pulse-repair');
+              cell._repairAcc = 0;
+            }
           }
         }
       }
@@ -1612,6 +1972,15 @@ function tick(dt) {
   tickPlayer('p1', dt);
   tickPlayer('p2', dt);
 
+  if (state.vsCpu) {
+    state.aiTimer += dt;
+    const diffCfg = CPU_DIFFICULTY[state.cpuDifficulty] || CPU_DIFFICULTY.normal;
+    while (state.aiTimer >= diffCfg.interval) {
+      state.aiTimer -= diffCfg.interval;
+      runCpuTurn(state.cpuPlayer, diffCfg);
+    }
+  }
+
   if (!state.gameOver) {
     const p1Dead = state.players.p1.core.hp <= 0;
     const p2Dead = state.players.p2.core.hp <= 0;
@@ -1627,6 +1996,459 @@ function tick(dt) {
       $('pause-btn').textContent = 'Resume';
     }
   }
+}
+
+/* ======================= CPU AI ======================= */
+// Single-player practice opponent. Combat itself (aiming, firing, hold-fire) is already fully
+// automatic in tickPlayer - turrets fire on their own the instant they're built - so the only
+// thing a CPU player actually needs to do is make the same build/research/unlock decisions a
+// human makes by clicking. runCpuTurn is called on a fixed cadence (not every frame) and does
+// AT MOST one action per call, through the same tryPlace/tryUnlockTile/startUpgrade* functions
+// the click handlers use - so nothing about how it plays is a special case, it just replaces
+// mouse clicks with a priority list.
+
+// Difficulty controls two different things: how OFTEN the CPU acts (interval) and how BIG a
+// base it's willing to commit to before it's satisfied (the min/max targets + upkeepFraction) -
+// reaction speed alone barely matters here since combat is fully automatic, so Normal and Hard
+// need genuinely different targets or they end up building the same small base at slightly
+// different speeds and the difficulty picker doesn't feel like it does anything.
+// minGenerators/minWalls/minLabs/minStorages are hard floors the CPU saves up for one at a time
+// before touching anything else (see the blocking milestones in runCpuTurn); maxWalls caps how
+// far it keeps tiling the wall line once free-building afterward; upkeepFraction is how much of
+// its own income it's willing to commit to standing turret upkeep (see step 1) - Hard runs its
+// economy close to the edge, Easy leaves a big cushion.
+// minGenerators in particular needs to be generous, not just "enough to cover turret upkeep":
+// research runs at the SIMULATION-TICK level (tickPlayer), not on the AI's decision cadence, and
+// it greedily spends whatever energy is left after turrets fire every single tick, throttling
+// down rather than ever going negative - so as long as a research node is active (which is
+// almost always, once the first Lab is up) it silently eats 100% of whatever thin margin is left
+// over from turret upkeep, and priorities 5-7 below (storage, more turrets, upgrades) never see
+// a surplus to spend even though they're checked every AI turn. The only real fix is more income
+// than turrets+research can jointly absorb - hence generator floors well above what step 1's
+// upkeepFraction alone would require.
+const CPU_TECH_ORDER = ['armor1', 'logistics1', 'firepower1', 'ordnance1', 'armor2', 'logistics2', 'firepower2', 'ordnance2', 'armor3', 'firepower3', 'ordnance3'];
+const CPU_DIFFICULTY = {
+  easy: {
+    interval: 2.8, techOrder: CPU_TECH_ORDER.slice(0, 4), randomTurret: true,
+    minGenerators: 3, minWalls: 4, maxWalls: 6, minLabs: 1, minStorages: 1, upkeepFraction: 0.55,
+  },
+  normal: {
+    interval: 1.3, techOrder: CPU_TECH_ORDER, randomTurret: true,
+    minGenerators: 6, minWalls: 8, maxWalls: 11, minLabs: 2, minStorages: 2, upkeepFraction: 0.75,
+  },
+  hard: {
+    interval: 0.5, techOrder: CPU_TECH_ORDER, randomTurret: false,
+    minGenerators: 9, minWalls: 12, maxWalls: GRID_COLS, minLabs: 3, minStorages: 3, upkeepFraction: 0.9,
+  },
+};
+const CPU_TURRET_KIND_PRIORITY = ['rocket', 'bullet', 'shotgun', 'missile', 'howitzer', 'laser', 'ionCannon'];
+const CPU_MIN_BULLETS_BEFORE_VARIETY = 2; // arm this many cheap Bullet Turrets for early defense, then stop defaulting to it
+
+// Highest tier of `kind` the CPU could build/mount RIGHT NOW (unlocked and affordable), 0 if none.
+function cpuBestAffordableTier(player, kind) {
+  const tiers = tiersArrayFor(kind);
+  for (let t = tiers.length; t >= 1; t--) {
+    if (!unlockedFor(player, tiers[t - 1])) continue;
+    if (player.energy >= cumulativeStats(kind, t).cost) return t;
+  }
+  return 0;
+}
+
+// Bullet Turret is unlocked and cheap from the very first second of the game, so a plain
+// "whatever's affordable right now" pick locks EVERY wall into it forever - by the time the
+// economy can afford a Rocket/Shotgun/Laser, every wall is already occupied by an armed Bullet
+// Turret, since step 1 arms a bare wall the instant anything at all is affordable for it. Once
+// a small baseline of bullets exists, prefer any OTHER unlocked kind - falling back to bullet
+// only when nothing pricier is reachable yet - so research actually shows up on the board.
+//
+// Even restricted to that pool, picking "whatever's affordable RIGHT NOW" every AI turn has the
+// same problem one rung up: Rocket (70⚡) crosses its own affordability threshold long before
+// Shotgun/Laser (85-90⚡) or Missile/Howitzer/Ion Cannon (150-260⚡) do, and since step 1 re-rolls
+// every single turn, it grabs Rocket the instant energy passes 70 almost every time - energy
+// essentially never lingers long enough for the pricier options to become reachable. The fix is
+// to COMMIT to one aspirational kind per bare wall and keep saving specifically toward IT across
+// turns (stored on the player, cleared once built) rather than re-evaluating "cheapest available"
+// from scratch every turn.
+//
+// The roll itself only screens out kinds that could NEVER be sustained on TOTAL current income
+// alone (a loose bar - ignores what's already committed elsewhere) - it deliberately does NOT
+// also require the pick to fit the CURRENT leftover headroom, or the roll pool would shrink to
+// "whatever's cheap enough to fit what's left over right now" and land back on Rocket almost
+// every time, the same bias one level up. The tight "does this actually fit alongside every
+// turret already running" check only happens below, every turn, while patiently waiting.
+function cpuPickTurret(player, diffCfg) {
+  const bulletsBuilt = cpuCountTurretKind(player, 'bullet');
+  const unlocked = CPU_TURRET_KIND_PRIORITY.filter((k) => unlockedFor(player, TURRET_KINDS[k].tiers[0]));
+  const pool = bulletsBuilt >= CPU_MIN_BULLETS_BEFORE_VARIETY ? unlocked.filter((k) => k !== 'bullet') : unlocked;
+  const candidateKinds = pool.length ? pool : unlocked;
+  if (!candidateKinds.length) return null;
+
+  const income = cpuEnergyIncomeRate(player);
+  const viableInPrinciple = (kind) => cpuTurretUpkeepFor(kind, 1) <= income * diffCfg.upkeepFraction;
+
+  if (!player._aiTurretAspiration || !candidateKinds.includes(player._aiTurretAspiration) || !viableInPrinciple(player._aiTurretAspiration)) {
+    const viable = candidateKinds.filter(viableInPrinciple);
+    const rollPool = viable.length ? viable : candidateKinds;
+    player._aiTurretAspiration = diffCfg.randomTurret
+      ? rollPool[Math.floor(Math.random() * rollPool.length)]
+      : rollPool[0];
+  }
+
+  const kind = player._aiTurretAspiration;
+  const tier = cpuBestAffordableTier(player, kind);
+  if (tier <= 0) return null; // still saving up the build cost
+  const currentUpkeep = cpuTurretUpkeepRate(player);
+  if (currentUpkeep + cpuTurretUpkeepFor(kind, tier) > income * diffCfg.upkeepFraction) return null; // doesn't fit alongside what's already running yet - keep waiting
+  player._aiTurretAspiration = null; // consumed - the next bare wall rolls a fresh aspiration
+  return { kind, tier };
+}
+
+function cpuPickNextResearch(player, diffCfg) {
+  for (const id of diffCfg.techOrder) {
+    if (player.completedResearch.has(id) || player.activeResearchNode === id) continue;
+    const node = TECH_TREE[id];
+    if (!techPrereqMet(player, node) || !techLabTierMet(player, node)) continue;
+    return id;
+  }
+  return null;
+}
+
+function cpuCountType(player, type) {
+  let n = 0;
+  for (let d = 0; d < GRID_DEPTH; d++) for (let c = 0; c < GRID_COLS; c++) if (player.grid[d][c].type === type) n++;
+  return n;
+}
+
+function cpuCountTurretKind(player, kind) {
+  let n = 0;
+  for (let d = 0; d < GRID_DEPTH; d++) for (let c = 0; c < GRID_COLS; c++) if (player.grid[d][c].turret?.kind === kind) n++;
+  return n;
+}
+
+function cpuFindWallNeedingTurret(player) {
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (cell.type === 'wall' && cell.status === 'active' && !cell.turret) return { d, c };
+    }
+  }
+  return null;
+}
+
+// Steady-state energy/sec a player has coming in from the core + every active generator.
+function cpuEnergyIncomeRate(player) {
+  let rate = CORE_ENERGY_RATE;
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (cell.type === 'generator' && cell.status === 'active') rate += TILE_TYPES.generator.tiers[cell.tier - 1].energyRate;
+    }
+  }
+  return rate;
+}
+
+// Steady-state energy/sec every currently-mounted, non-held turret is burning through firing on
+// its own (turrets fire automatically the instant they're built - see tickPlayer). Laser/Ion
+// Cannon already track cost as energyPerSecond; everything else fires energyPerShot every
+// fireInterval seconds, so its average rate is the quotient of the two.
+function cpuTurretUpkeepRate(player) {
+  let rate = 0;
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const t = player.grid[d][c].turret;
+      if (!t || t.status !== 'active' || t.holdFire) continue;
+      const tierCfg = TURRET_KINDS[t.kind].tiers[t.tier - 1];
+      rate += tierCfg.energyPerSecond != null ? tierCfg.energyPerSecond : tierCfg.energyPerShot / tierCfg.fireInterval;
+    }
+  }
+  return rate;
+}
+
+// Only the row adjacent to the Core (depth GRID_DEPTH-1) starts unlocked - depth 0 (nearest the
+// neutral zone, the "real" front line) has to be bought open a tile at a time - see makePlayer.
+// resolveDefender resolves per column, shallowest-non-empty-cell-first: whatever sits at the
+// LOWEST depth in a column is the only thing that column's incoming fire ever hits, and it
+// protects everything behind it in the SAME column. A generic "first open tile" spot-finder is
+// blind to that - it'll happily park a Research Lab in the very first empty slot even when
+// that slot is the exposed front of an otherwise-empty column, and just as happily stack a
+// second wall behind a column that's already covered while a different column's Lab sits
+// undefended. The two finders below are column-aware instead: cpuFindWallSpot always tries to
+// give a bare column its first wall before reinforcing one that already has coverage;
+// cpuFindProtectedSpot only ever places a vulnerable building (generator/lab/storage) somewhere
+// that's already shielded by a wall at a shallower depth in the same column.
+function cpuFindEmptySpot(player) {
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (cell.unlocked && cell.type === 'empty') return { d, c };
+    }
+  }
+  return null;
+}
+
+function cpuColumnHasWall(player, col) {
+  for (let d = 0; d < GRID_DEPTH; d++) if (player.grid[d][col].type === 'wall') return true;
+  return false;
+}
+
+function cpuColumnHasAnything(player, col) {
+  for (let d = 0; d < GRID_DEPTH; d++) if (player.grid[d][col].type !== 'empty') return true;
+  return false;
+}
+
+function cpuFirstOpenDepthInColumn(player, col) {
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    if (player.grid[d][col].unlocked && player.grid[d][col].type === 'empty') return d;
+  }
+  return null;
+}
+
+// A column with a built (non-wall) structure in it but no wall anywhere is an exposed
+// investment - e.g. a Lab sitting with nothing in front of it. Returns the first open depth to
+// wall it off at, or null if either no column is exposed or every exposed column's remaining
+// depths are all still locked (see cpuTryUnlockForExposedColumn for that case).
+function cpuFindExposedColumnSpot(player) {
+  for (let c = 0; c < GRID_COLS; c++) {
+    if (cpuColumnHasWall(player, c) || !cpuColumnHasAnything(player, c)) continue;
+    const d = cpuFirstOpenDepthInColumn(player, c);
+    if (d !== null) return { d, c };
+  }
+  return null;
+}
+
+// If an exposed column's remaining depths are all locked (so cpuFindExposedColumnSpot can't
+// place a wall there yet), unlock one of them specifically - rather than leaving that column
+// exposed indefinitely while cpuTryUnlockOne's generic fallback opens up tiles elsewhere instead.
+function cpuTryUnlockForExposedColumn(playerKey, player) {
+  if (player.energy < TILE_UNLOCK_COST) return false;
+  for (let c = 0; c < GRID_COLS; c++) {
+    if (cpuColumnHasWall(player, c) || !cpuColumnHasAnything(player, c)) continue;
+    for (let d = 0; d < GRID_DEPTH; d++) {
+      if (!player.grid[d][c].unlocked) { tryUnlockTile(playerKey, d, c); return true; }
+    }
+  }
+  return false;
+}
+
+// Where to build a new wall: most urgently, an exposed column (see cpuFindExposedColumnSpot).
+// Next, any column with no wall at all. Only once every column already has at least one wall
+// does this fall back to reinforcing/expanding normally.
+function cpuFindWallSpot(player) {
+  const exposedSpot = cpuFindExposedColumnSpot(player);
+  if (exposedSpot) return exposedSpot;
+  for (let c = 0; c < GRID_COLS; c++) {
+    if (cpuColumnHasWall(player, c)) continue;
+    const d = cpuFirstOpenDepthInColumn(player, c);
+    if (d !== null) return { d, c };
+  }
+  return cpuFindEmptySpot(player);
+}
+
+// Where to build a vulnerable (non-wall) structure: only in a column that already has an active
+// wall at a shallower depth shielding it, preferring the deepest such slot (furthest behind the
+// wall). Falls back to the deepest empty slot anywhere if no protected column has room -
+// unprotected-but-built still beats not building it at all.
+function cpuFindProtectedSpot(player) {
+  for (let d = GRID_DEPTH - 1; d >= 0; d--) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (!cell.unlocked || cell.type !== 'empty') continue;
+      let shielded = false;
+      for (let dd = 0; dd < d; dd++) {
+        const front = player.grid[dd][c];
+        if (front.type === 'wall' && front.status !== 'deconstructing') { shielded = true; break; }
+      }
+      if (shielded) return { d, c };
+    }
+  }
+  // No shielded slot anywhere yet - fall back to an unshielded one, but NEVER depth 0. Depth 0
+  // is the frontmost possible position in a column - nothing can ever be built shallower than
+  // it in the SAME column, so a wall could never actually cover it later either (that's the
+  // "useless wall behind an exposed building" case: step 1b would find the only open depth left
+  // in that column is deeper than the exposed structure, and a wall placed there protects
+  // nothing). Depth 1-3 can still be walled off later even if it's exposed for now.
+  for (let d = GRID_DEPTH - 1; d >= 1; d--) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (cell.unlocked && cell.type === 'empty') return { d, c };
+    }
+  }
+  return null;
+}
+
+function cpuSpotFor(player, kind) {
+  return kind === 'wall' ? cpuFindWallSpot(player) : cpuFindProtectedSpot(player);
+}
+
+// Looks for any active, non-upgrading base tile or turret one tier below its cap that the CPU
+// can currently afford to upgrade - first match wins (scan order = front-to-back, left-to-right).
+function cpuFindUpgradeCandidate(player) {
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      const cell = player.grid[d][c];
+      if (cell.type === 'empty') continue;
+      if (cell.type !== 'researchLab' && cell.status === 'active' && !cell.upgrading) {
+        const nextCfg = TILE_TYPES[cell.type].tiers[cell.tier];
+        if (nextCfg && unlockedFor(player, nextCfg) && player.energy >= nextCfg.cost) return { kind: 'base', d, c };
+      }
+      if (cell.turret && cell.turret.status === 'active' && !cell.turret.upgrading) {
+        const nextCfg = TURRET_KINDS[cell.turret.kind].tiers[cell.turret.tier];
+        if (nextCfg && unlockedFor(player, nextCfg) && player.energy >= nextCfg.cost) return { kind: 'turret', d, c };
+      }
+    }
+  }
+  return null;
+}
+
+// How much energy/sec mounting `kind` at `tier` would add to the player's standing turret
+// upkeep - same math as cpuTurretUpkeepRate, for one hypothetical turret.
+function cpuTurretUpkeepFor(kind, tier) {
+  const tierCfg = TURRET_KINDS[kind].tiers[tier - 1];
+  return tierCfg.energyPerSecond != null ? tierCfg.energyPerSecond : tierCfg.energyPerShot / tierCfg.fireInterval;
+}
+
+function cpuTryUnlockOne(playerKey, player) {
+  if (player.energy < TILE_UNLOCK_COST) return false;
+  for (let d = 0; d < GRID_DEPTH; d++) {
+    for (let c = 0; c < GRID_COLS; c++) {
+      if (!player.grid[d][c].unlocked) { tryUnlockTile(playerKey, d, c); return true; }
+    }
+  }
+  return false;
+}
+
+// Used by the blocking milestones below: build `kind` at the best spot for that kind (see
+// cpuSpotFor - walls seek out undefended columns, everything else seeks cover behind a wall).
+// Only falls back to unlocking more board when the milestone IS affordable but there's simply
+// nowhere left to put it (depth 3, or wherever's currently unlocked, is full) - so it doesn't
+// block forever with no path forward. If it's not affordable yet, do nothing and let energy
+// accumulate untouched; unlocking isn't the bottleneck when there's already room to spare.
+function cpuBuildTowardMilestone(playerKey, player, kind, tier) {
+  if (tier <= 0) return;
+  const spot = cpuSpotFor(player, kind);
+  if (spot) { tryPlace(playerKey, spot.d, spot.c, kind, tier); return; }
+  cpuTryUnlockOne(playerKey, player);
+}
+
+// Milestones below (steps 2-5) `return` immediately whether or not they could actually afford
+// their target this turn, rather than falling through to whatever's cheapest - a wall is always
+// cheaper than a Research Lab, so without this a lab never actually gets saved up for; something
+// affordable always wins the turn first. Blocking means energy just accumulates, untouched,
+// until the current milestone's target is reachable.
+function runCpuTurn(playerKey, diffCfg) {
+  const player = state.players[playerKey];
+  if (!player.autoRepair) player.autoRepair = true; // set-and-forget, same as a sensible human would
+
+  // 0. energy triage: step 1's sustainability check only stops NEW turrets from outrunning
+  // income - it doesn't notice if the opponent later destroys a generator out from under an
+  // already-committed set of turrets. When that happens, upkeep can end up permanently exceeding
+  // income, and since a turret spends the instant there's enough energy for one shot, energy
+  // never accumulates enough for anything else ever again - every priority below just silently
+  // starves forever. Recognizing that and holding fire across the board until the economy
+  // actually recovers is what keeps a bad fight from being a permanent, invisible deadlock.
+  const incomeNow = cpuEnergyIncomeRate(player);
+  const upkeepNow = cpuTurretUpkeepRate(player);
+  if (upkeepNow > incomeNow) {
+    player.globalHoldFire = true;
+  } else if (player.globalHoldFire && upkeepNow <= incomeNow * 0.7) {
+    player.globalHoldFire = false;
+  }
+
+  const generators = cpuCountType(player, 'generator');
+  const storages = cpuCountType(player, 'storage');
+  const labs = cpuCountType(player, 'researchLab');
+  const walls = cpuCountType(player, 'wall');
+
+  // 1. arm any wall that's standing bare - undefended firepower is wasted energy sitting idle.
+  // cpuPickTurret already restricts its candidates to ones that keep standing turret upkeep
+  // within diffCfg.upkeepFraction of current income - without that, the CPU could mount turrets
+  // whose combined upkeep exceeds what it earns, pinning its own energy at ~0 forever and
+  // permanently blocking every priority below. If nothing sustainable is available yet, leave
+  // the wall bare for now and grow the economy instead.
+  const bareWall = cpuFindWallNeedingTurret(player);
+  if (bareWall) {
+    const pick = cpuPickTurret(player, diffCfg);
+    if (pick) {
+      tryPlace(playerKey, bareWall.d, bareWall.c, pick.kind, pick.tier);
+      // An Ion Cannon is built pre-held (see tryPlace) - a human has to explicitly release it
+      // since it just keeps draining energy once started, but the CPU built it BECAUSE it
+      // decided this was worth firing, so leaving it held would waste the energy just spent.
+      if (pick.kind === 'ionCannon') player.grid[bareWall.d][bareWall.c].turret.holdFire = false;
+      return;
+    }
+  }
+
+  // 1b. cover any column that already has a built (non-wall) structure but no wall yet - an
+  // exposed Lab/Generator/Storage is money already spent sitting completely undefended, which is
+  // strictly worse than a gap in the raw wall-COUNT target below (step 3 only fires while
+  // walls < diffCfg.minWalls - once that's satisfied via OTHER columns, nothing would otherwise
+  // ever go back and cover one that's still exposed). Not a strict block: if a wall isn't
+  // affordable yet, or the column's remaining depths are all still locked, fall through and keep
+  // growing the economy instead of freezing on it.
+  const exposedSpot = cpuFindExposedColumnSpot(player);
+  if (exposedSpot) {
+    const tier = cpuBestAffordableTier(player, 'wall');
+    if (tier > 0) { tryPlace(playerKey, exposedSpot.d, exposedSpot.c, 'wall', tier); return; }
+  } else if (cpuTryUnlockForExposedColumn(playerKey, player)) {
+    return;
+  }
+
+  // 2. keep a minimum viable energy economy before committing to anything pricier - see
+  // diffCfg.minGenerators (bigger on higher difficulties, so income comfortably outpaces what a
+  // larger standing turret line burns through once it's up - see step 1).
+  if (generators < diffCfg.minGenerators) {
+    cpuBuildTowardMilestone(playerKey, player, 'generator', cpuBestAffordableTier(player, 'generator'));
+    return;
+  }
+
+  // 3. get a real wall line up before worrying about research/storage
+  if (walls < diffCfg.minWalls) {
+    cpuBuildTowardMilestone(playerKey, player, 'wall', cpuBestAffordableTier(player, 'wall'));
+    return;
+  }
+
+  // 4. research - get enough labs up (research rate stacks across every active Lab a player
+  // owns), then keep a project active at all times
+  if (labs < diffCfg.minLabs) {
+    cpuBuildTowardMilestone(playerKey, player, 'researchLab', cpuBestAffordableTier(player, 'researchLab'));
+    return;
+  }
+  if (!player.activeResearchNode) {
+    const nodeId = cpuPickNextResearch(player, diffCfg);
+    if (nodeId) { player.activeResearchNode = nodeId; player.researchProgress = 0; return; }
+    // Nothing currently researchable (tree exhausted, or waiting on a Lab tier that only arrives
+    // by completing a DIFFERENT node) - fall through instead of blocking every turn forever.
+  }
+
+  // 5. energy storage once there's an economy worth protecting from capping out
+  if (storages < diffCfg.minStorages) {
+    cpuBuildTowardMilestone(playerKey, player, 'storage', cpuBestAffordableTier(player, 'storage'));
+    return;
+  }
+
+  // 6. every milestone above is met - spend spare energy upgrading whatever's already built
+  const upgradeCandidate = cpuFindUpgradeCandidate(player);
+  if (upgradeCandidate) {
+    const cell = player.grid[upgradeCandidate.d][upgradeCandidate.c];
+    const ok = upgradeCandidate.kind === 'base' ? startUpgradeBase(player, cell) : startUpgradeTurret(player, cell);
+    if (ok) return;
+  }
+
+  // 7. still got room and energy to spare - keep expanding, capping walls at diffCfg.maxWalls so
+  // the rotation doesn't just tile the whole row in walls once nothing else is left to do. Pick
+  // the kind FIRST, then find where it belongs (see cpuSpotFor) - not the other way around,
+  // otherwise a spot found for one kind (e.g. an exposed front tile, fine for a wall) gets used
+  // for whatever kind the dice happened to land on instead.
+  const pool = walls < diffCfg.maxWalls ? ['wall', 'generator', 'researchLab', 'storage'] : ['generator', 'researchLab', 'storage'];
+  const kind = pool[Math.floor(Math.random() * pool.length)];
+  const tier = cpuBestAffordableTier(player, kind);
+  if (tier > 0) {
+    const spot = cpuSpotFor(player, kind);
+    if (spot) { tryPlace(playerKey, spot.d, spot.c, kind, tier); return; }
+  }
+
+  // 8. nothing left to build - expand the board instead of sitting on spare energy
+  if (player.energy >= TILE_UNLOCK_COST * 1.5) cpuTryUnlockOne(playerKey, player);
 }
 
 /* ======================= RENDER ======================= */
@@ -2134,8 +2956,7 @@ function renderTechTreeOverlay() {
   const cancelBtn = $('tt-cancel-research');
   if (cancelBtn) {
     cancelBtn.addEventListener('click', () => {
-      player.activeResearchNode = null;
-      player.researchProgress = 0;
+      runAction('cancelResearch', playerKey, {});
       renderAll();
     });
   }
@@ -2148,8 +2969,7 @@ function renderTechTreeOverlay() {
       if (player.completedResearch.has(id) || player.activeResearchNode === id) return;
       if (!techPrereqMet(player, node)) { showToast(`Locked — research ${techNodeDisplayName(TECH_TREE[node.requires])} first.`); return; }
       if (!techLabTierMet(player, node)) { showToast(`Locked — needs a Research Lab at Tier ${node.labTier}.`); return; }
-      player.activeResearchNode = id;
-      player.researchProgress = 0;
+      runAction('selectResearchNode', playerKey, { nodeId: id });
       renderAll();
     });
   });
@@ -2331,8 +3151,8 @@ function renderInspector() {
 
   const bind = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
 
-  bind('act-cancel-construct', () => { cancelConstruction(player, cell); state.selected = null; renderAll(); });
-  bind('act-cancel-deconstruct', () => { cancelDeconstruct(cell); renderAll(); });
+  bind('act-cancel-construct', () => { runAction('cancelConstruction', playerKey, { depth, col }); state.selected = null; renderAll(); });
+  bind('act-cancel-deconstruct', () => { runAction('cancelDeconstruct', playerKey, { depth, col }); renderAll(); });
 
   const hpFillEl = $('insp-hp-fill');
   const hpTextEl = $('insp-hp-text');
@@ -2365,7 +3185,7 @@ function renderInspector() {
       const nextCfg = def.tiers[cell.tier];
       if (!unlockedFor(player, nextCfg)) { showToast(`Locked — research ${missingTechLabel(player, nextCfg)} first.`); return; }
       if (player.energy < nextCfg.cost) { showToast(`Not enough energy — need ${nextCfg.cost}⚡, have ${Math.floor(player.energy)}⚡.`); return; }
-      startUpgradeBase(player, cell);
+      runAction('startUpgradeBase', playerKey, { depth, col });
       renderAll();
     });
   }
@@ -2376,7 +3196,7 @@ function renderInspector() {
       if (cell.upgrading) upgradeStatusEl.textContent = `Upgrading… ${Math.ceil(cell.upgrading.progress)}s`;
     });
   }
-  bind('act-cancel-upgrade', () => { cancelUpgradeBase(player, cell); renderAll(); });
+  bind('act-cancel-upgrade', () => { runAction('cancelUpgradeBase', playerKey, { depth, col }); renderAll(); });
 
   const repairBtn = $('act-repair');
   if (repairBtn) {
@@ -2393,7 +3213,7 @@ function renderInspector() {
       const missing = cell.maxHp - cell.hp;
       const cost = Math.ceil(missing * REPAIR_COST_PER_HP);
       if (player.energy < cost) { showToast(`Not enough energy to repair — need ${cost}⚡, have ${Math.floor(player.energy)}⚡.`); return; }
-      repairBase(player, cell);
+      runAction('repairBase', playerKey, { depth, col });
       renderAll();
     });
   }
@@ -2409,13 +3229,13 @@ function renderInspector() {
     });
     btn.addEventListener('click', () => {
       if (player.energy < tc.cost) { showToast(`Not enough energy — need ${tc.cost}⚡, have ${Math.floor(player.energy)}⚡.`); return; }
-      tryPlace(playerKey, depth, col, k);
+      runAction('place', playerKey, { depth, col, kind: k, tier: 1 });
       renderAll();
     });
   });
 
-  bind('act-cancel-turret-construct', () => { cancelTurretConstruction(player, cell); renderAll(); });
-  bind('act-cancel-turret-deconstruct', () => { cancelTurretDeconstruct(cell); renderAll(); });
+  bind('act-cancel-turret-construct', () => { runAction('cancelTurretConstruction', playerKey, { depth, col }); renderAll(); });
+  bind('act-cancel-turret-deconstruct', () => { runAction('cancelTurretDeconstruct', playerKey, { depth, col }); renderAll(); });
 
   const turretStatusEl = $('insp-turret-status-sub');
   const turretStatsEl = $('insp-turret-stats');
@@ -2447,7 +3267,7 @@ function renderInspector() {
       }
       holdBtn.classList.toggle('active', held);
     });
-    holdBtn.addEventListener('click', () => { toggleHoldFire(cell); renderAll(); });
+    holdBtn.addEventListener('click', () => { runAction('toggleHoldFire', playerKey, { depth, col }); renderAll(); });
   }
 
   const turretUpgradeStatusEl = $('insp-turret-upgrade-status');
@@ -2456,7 +3276,7 @@ function renderInspector() {
       if (cell.turret && cell.turret.upgrading) turretUpgradeStatusEl.textContent = `Upgrading… ${Math.ceil(cell.turret.upgrading.progress)}s`;
     });
   }
-  bind('act-cancel-upgrade-turret', () => { cancelUpgradeTurret(player, cell); renderAll(); });
+  bind('act-cancel-upgrade-turret', () => { runAction('cancelUpgradeTurret', playerKey, { depth, col }); renderAll(); });
 
   const upgradeTurretBtn = $('act-upgrade-turret');
   if (upgradeTurretBtn && cell.turret) {
@@ -2477,13 +3297,13 @@ function renderInspector() {
       const nextCfg = kindDef.tiers[turret.tier];
       if (!unlockedFor(player, nextCfg)) { showToast(`Locked — research ${missingTechLabel(player, nextCfg)} first.`); return; }
       if (player.energy < nextCfg.cost) { showToast(`Not enough energy — need ${nextCfg.cost}⚡, have ${Math.floor(player.energy)}⚡.`); return; }
-      startUpgradeTurret(player, cell);
+      runAction('startUpgradeTurret', playerKey, { depth, col });
       renderAll();
     });
   }
 
-  bind('act-remove-turret', () => { startTurretDeconstruct(cell); renderAll(); });
-  bind('act-deconstruct', () => { startDeconstruct(cell); renderAll(); });
+  bind('act-remove-turret', () => { runAction('startTurretDeconstruct', playerKey, { depth, col }); renderAll(); });
+  bind('act-deconstruct', () => { runAction('startDeconstruct', playerKey, { depth, col }); renderAll(); });
 
   if (cell.type === 'researchLab' && cell.status !== 'deconstructing') {
     const techFillEl = $('insp-tech-fill');
@@ -2534,9 +3354,20 @@ function frame(ts) {
   state.lastTime = ts;
   dt = Math.min(dt, 0.25);
 
-  if (state.started && !state.paused && !state.gameOver) {
+  const isGuest = net.active && net.role === 'guest';
+
+  if (!isGuest && state.started && !state.paused && !state.gameOver) {
     tick(dt * state.speed);
   }
+
+  if (net.active && net.role === 'host' && net.connected) {
+    netSnapshotAccum += dt;
+    if (netSnapshotAccum >= NET_SNAPSHOT_INTERVAL) {
+      netSnapshotAccum = 0;
+      netSend(buildSnapshot());
+    }
+  }
+
   renderLive();
   renderInspector();
   requestAnimationFrame(frame);
@@ -2567,9 +3398,90 @@ function resetGame() {
   $('countdown-overlay').classList.add('hidden');
   $('start-overlay').classList.remove('hidden');
   renderAll();
+  updateOnlineUI();
+}
+
+// Mode/difficulty picked on the start screen, applied to `state` once Start Game is actually
+// pressed - kept as plain variables (not on `state`) so resetGame()/Play Again don't have to
+// know about them, and the buttons' last-picked state just survives untouched across restarts.
+let selectedMode = 'pvp';
+let selectedDifficulty = 'normal';
+
+document.querySelectorAll('#mode-select .mode-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.mode !== 'online' && net.active) teardownNetworking();
+    selectedMode = btn.dataset.mode;
+    document.querySelectorAll('#mode-select .mode-btn').forEach((b) => b.classList.toggle('active', b === btn));
+    $('difficulty-select').classList.toggle('hidden', selectedMode !== 'cpu');
+    updateOnlineUI();
+  });
+});
+
+document.querySelectorAll('#difficulty-select .diff-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    selectedDifficulty = btn.dataset.diff;
+    document.querySelectorAll('#difficulty-select .diff-btn').forEach((b) => b.classList.toggle('active', b === btn));
+  });
+});
+
+document.querySelectorAll('#online-choice .mode-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#online-choice .mode-btn').forEach((b) => b.classList.toggle('active', b === btn));
+    const wantHost = btn.dataset.online === 'host';
+    $('online-host-box').classList.toggle('hidden', !wantHost);
+    $('online-join-box').classList.toggle('hidden', wantHost);
+    if (wantHost && !net.peer) startHosting();
+    updateOnlineUI();
+  });
+});
+
+$('online-copy-btn').addEventListener('click', () => {
+  const input = $('online-link-input');
+  input.select();
+  const btn = $('online-copy-btn');
+  const revert = () => { btn.textContent = 'Copy'; };
+  const copied = () => { btn.textContent = 'Copied!'; setTimeout(revert, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(copied).catch(() => document.execCommand('copy') && copied());
+  } else {
+    document.execCommand('copy');
+    copied();
+  }
+});
+
+$('online-join-btn').addEventListener('click', () => {
+  startJoining($('online-join-input').value);
+  updateOnlineUI();
+});
+
+// Greys out and locks the side someone else is driving (CPU, or your friend online) for click
+// purposes - the automated/remote side still acts on it directly through the same game
+// functions, this only stops a human from also poking at it. See the [data-locked-side] rules
+// in style.css.
+function applyLockVisuals() {
+  const label = { p1: 'P1', p2: 'P2' };
+  let locked = '';
+  if (state.vsCpu) {
+    locked = state.cpuPlayer;
+    label[state.cpuPlayer] = `${state.cpuPlayer.toUpperCase()} (CPU)`;
+  } else if (net.active) {
+    locked = otherKey(net.myPlayerKey);
+    label[net.myPlayerKey] = `${net.myPlayerKey.toUpperCase()} (You)`;
+    label[locked] = `${locked.toUpperCase()} (Friend)`;
+  }
+  document.body.dataset.lockedSide = locked;
+  Object.keys(label).forEach((k) => {
+    const el = document.querySelector(`#card-${k} .player-label`);
+    if (el) el.textContent = label[k];
+  });
 }
 
 function beginCountdown() {
+  state.vsCpu = selectedMode === 'cpu';
+  state.cpuDifficulty = selectedDifficulty;
+  state.aiTimer = 0;
+  applyLockVisuals();
+
   $('start-overlay').classList.add('hidden');
   const countdownEl = $('countdown-overlay');
   const numberEl = $('countdown-number');
@@ -2601,23 +3513,39 @@ function beginCountdown() {
   setTimeout(step, 800);
 }
 
-$('start-btn').addEventListener('click', beginCountdown);
+$('start-btn').addEventListener('click', () => {
+  if (selectedMode === 'online') {
+    if (net.role !== 'host' || !net.connected) return;
+    netSend({ t: 'start' });
+  }
+  beginCountdown();
+});
 
 $('pause-btn').addEventListener('click', () => {
+  if (net.active && net.role === 'guest') return; // host-only control online
   if (state.gameOver) return;
   state.paused = !state.paused;
   $('pause-btn').textContent = state.paused ? 'Resume' : 'Pause';
 });
 
 $('speed-select').addEventListener('change', (e) => {
+  if (net.active && net.role === 'guest') return; // host-only control online
   state.speed = parseFloat(e.target.value);
 });
 
 $('reset-btn').addEventListener('click', () => {
-  if (confirm('Reset the game? All progress will be lost.')) resetGame();
+  if (net.active && net.role === 'guest') return; // host-only control online
+  if (confirm('Reset the game? All progress will be lost.')) {
+    if (net.active) netSend({ t: 'reset' });
+    resetGame();
+  }
 });
 
-$('game-over-reset').addEventListener('click', resetGame);
+$('game-over-reset').addEventListener('click', () => {
+  if (net.active && net.role === 'guest') return; // host-only control online
+  if (net.active) netSend({ t: 'reset' });
+  resetGame();
+});
 
 $('help-btn').addEventListener('click', () => $('help-overlay').classList.remove('hidden'));
 $('help-close').addEventListener('click', () => $('help-overlay').classList.add('hidden'));
@@ -2638,4 +3566,21 @@ buildBoard();
 fitBoard();
 window.addEventListener('resize', fitBoard);
 renderAll();
+
+// A link shared by a host (see startHosting) lands here as ?join=<peerId> - jump straight to the
+// Join flow with the code prefilled and already connecting, so the friend just has to open it.
+(() => {
+  const joinId = new URLSearchParams(location.search).get('join');
+  if (!joinId) return;
+  document.querySelectorAll('#mode-select .mode-btn').forEach((b) => b.classList.toggle('active', b.dataset.mode === 'online'));
+  selectedMode = 'online';
+  $('difficulty-select').classList.add('hidden');
+  document.querySelectorAll('#online-choice .mode-btn').forEach((b) => b.classList.toggle('active', b.dataset.online === 'join'));
+  $('online-host-box').classList.add('hidden');
+  $('online-join-box').classList.remove('hidden');
+  $('online-join-input').value = joinId;
+  startJoining(joinId);
+  updateOnlineUI();
+})();
+
 requestAnimationFrame(frame);

@@ -108,7 +108,43 @@
   <div id="start-overlay">
     <div id="start-box">
       <h2>Affinity Arsenal</h2>
-      <p>Two cores. Build walls, turrets, generators and research on your own side, defend your core, and destroy theirs. Playable hotseat — build on either side.</p>
+      <p>Two cores. Build walls, turrets, generators and research on your own side, defend your core, and destroy theirs.</p>
+      <div id="mode-select" class="pill-select">
+        <button type="button" class="mode-btn active" data-mode="pvp">2 Player (Hotseat)</button>
+        <button type="button" class="mode-btn" data-mode="cpu">1 Player (vs CPU)</button>
+        <button type="button" class="mode-btn" data-mode="online">Online (vs Friend)</button>
+      </div>
+      <div id="difficulty-select" class="pill-select hidden">
+        <button type="button" class="diff-btn" data-diff="easy">Easy</button>
+        <button type="button" class="diff-btn active" data-diff="normal">Normal</button>
+        <button type="button" class="diff-btn" data-diff="hard">Hard</button>
+      </div>
+
+      <div id="online-panel" class="hidden">
+        <div id="online-choice" class="pill-select">
+          <button type="button" class="mode-btn" data-online="host">Host Game</button>
+          <button type="button" class="mode-btn" data-online="join">Join Game</button>
+        </div>
+
+        <div id="online-host-box" class="online-box hidden">
+          <p class="online-hint">Send this link to your friend. Once they open it, you'll both be able to start.</p>
+          <div class="online-link-row">
+            <input type="text" id="online-link-input" readonly>
+            <button type="button" id="online-copy-btn" class="ctrl-btn">Copy</button>
+          </div>
+          <p id="online-status" class="online-hint">Waiting for a connection…</p>
+        </div>
+
+        <div id="online-join-box" class="online-box hidden">
+          <p class="online-hint">Paste the link (or just the code) your friend sent you.</p>
+          <div class="online-link-row">
+            <input type="text" id="online-join-input" placeholder="Paste link or code here">
+            <button type="button" id="online-join-btn" class="ctrl-btn">Connect</button>
+          </div>
+          <p id="online-join-status" class="online-hint"></p>
+        </div>
+      </div>
+
       <button id="start-btn" class="ctrl-btn">Start Game</button>
     </div>
   </div>
@@ -118,6 +154,7 @@
   </div>
 
 </div>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="game.js"></script>
 </body>
 </html>

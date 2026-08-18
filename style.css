@@ -516,6 +516,53 @@ html, body {
   to { width: 32px; height: 32px; opacity: 0; }
 }
 
+/* Floating "+N" readout that pops off a producing tile once per in-game second - the tick
+   the simulation already does silently (generator income, research progress, auto-repair
+   healing), made visible so the board reads like it's alive without opening an inspector. */
+.float-fx {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  opacity: 1;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+  transition: transform 0.9s cubic-bezier(0.15, 0.7, 0.3, 1), opacity 0.9s ease-in;
+  z-index: 9;
+}
+.float-fx.rise { transform: translate(-50%, calc(-50% - 30px)); opacity: 0; }
+.float-fx.fx-energy { color: var(--energy-color); }
+.float-fx.fx-research { color: var(--research-color); }
+.float-fx.fx-repair { color: var(--hp-good); }
+
+.cell.pulse-energy { animation: pulse-energy 0.55s ease-out; }
+@keyframes pulse-energy {
+  0% { box-shadow: 0 0 0 2px var(--energy-color) inset, 0 0 10px 2px var(--energy-color); }
+  100% { box-shadow: 0 0 0 0 transparent inset, 0 0 0 0 transparent; }
+}
+
+.cell.pulse-research { animation: pulse-research 0.55s ease-out; }
+@keyframes pulse-research {
+  0% { box-shadow: 0 0 0 2px var(--research-color) inset, 0 0 10px 2px var(--research-color); }
+  100% { box-shadow: 0 0 0 0 transparent inset, 0 0 0 0 transparent; }
+}
+
+.cell.pulse-repair { animation: pulse-repair 0.55s ease-out; }
+@keyframes pulse-repair {
+  0% { box-shadow: 0 0 0 2px var(--hp-good) inset, 0 0 10px 2px var(--hp-good); }
+  100% { box-shadow: 0 0 0 0 transparent inset, 0 0 0 0 transparent; }
+}
+
+/* A Research Lab actively contributing to the player's current project gets a slow ambient
+   glow the whole time (distinct from the once-a-second pulse above), so "this lab is working"
+   reads even between heartbeats - mirrors needs-attention, which covers the opposite state. */
+.cell.researching-visual { animation: lab-glow 1.6s ease-in-out infinite; }
+@keyframes lab-glow {
+  0%, 100% { box-shadow: 0 0 3px 1px var(--research-color) inset; }
+  50% { box-shadow: 0 0 8px 2px var(--research-color) inset; }
+}
+
 /* ---------- Inspector ---------- */
 
 #inspector {
@@ -802,6 +849,86 @@ html, body {
   margin-top: 8px;
 }
 #start-box .ctrl-btn:hover { background: var(--accent); color: #1a1300; }
+
+.pill-select {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 14px 0;
+}
+.pill-select.hidden { display: none; }
+.pill-select button {
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg-2);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.pill-select button:hover { border-color: var(--accent); color: var(--text); }
+.pill-select button.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #1a1300;
+  font-weight: 700;
+}
+
+#online-panel.hidden, .online-box.hidden { display: none; }
+.online-box {
+  margin-top: 4px;
+  text-align: left;
+}
+.online-hint {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 6px 0;
+}
+.online-link-row {
+  display: flex;
+  gap: 6px;
+}
+.online-link-row input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg-2);
+  color: var(--text);
+}
+.online-link-row .ctrl-btn {
+  font-size: 13px;
+  padding: 8px 14px;
+  white-space: nowrap;
+}
+#online-status.connected, #online-join-status.connected { color: var(--hp-good, #6cbf6c); }
+#online-status.error, #online-join-status.error { color: var(--hp-bad, #d9645f); }
+
+/* Locks one side's card + board tiles for CLICKING - used both when the CPU is driving a side
+   (runCpuTurn still acts on it directly through the same game functions) and in online play
+   (the other side is your friend's browser, not yours). The human can still see it, just not
+   touch it. Core cells stay clickable (view-only, nothing to mutate there). */
+body[data-locked-side="p1"] #card-p1 {
+  pointer-events: none;
+  opacity: 0.6;
+  filter: grayscale(0.35);
+}
+body[data-locked-side="p1"] .cell[data-player="p1"] {
+  pointer-events: none;
+}
+body[data-locked-side="p2"] #card-p2 {
+  pointer-events: none;
+  opacity: 0.6;
+  filter: grayscale(0.35);
+}
+body[data-locked-side="p2"] .cell[data-player="p2"] {
+  pointer-events: none;
+}
 
 #countdown-number {
   font-size: 120px;
