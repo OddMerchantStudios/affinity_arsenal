@@ -368,6 +368,17 @@ function netSend(msg) {
   if (net.conn && net.connected) net.conn.send(msg);
 }
 
+// One-off ambient VFX (the "+2⚡" that pops off a generator, "+0.4🔬" off a lab, "+6❤" off
+// auto-repair) are fired as pure DOM side effects from inside tickPlayer, which only ever runs
+// on the host - so without this, the guest would just see the numbers tick up with no visible
+// heartbeat. These fire at most once per second per tile, so it's cheap to mirror as its own
+// small message rather than folding it into the state snapshot.
+function netFx(playerKey, d, c, text, cssClass, pulseClass) {
+  if (net.active && net.role === 'host' && net.connected) {
+    netSend({ t: 'fx', playerKey, d, c, text, cssClass, pulseClass });
+  }
+}
+
 // --- snapshot (host's authoritative gameplay state -> guest's mirror) ---
 // Deliberately hand-rolled rather than JSON.stringify(state.players) - a turret mid-beam holds a
 // live DOM node (cell.turret.beamEl, see makeEmptyCell's comment) which isn't serializable, and
@@ -510,6 +521,13 @@ function handleNetMessage(msg) {
       beginCountdown();
     } else if (msg.t === 'reset') {
       resetGame();
+    } else if (msg.t === 'fx') {
+      const row = cellEls[msg.playerKey] && cellEls[msg.playerKey][msg.d];
+      const cellEl = row && row[msg.c] && row[msg.c].root;
+      if (cellEl) {
+        spawnFloatText(cellEl, msg.text, msg.cssClass);
+        pulseCell(cellEl, msg.pulseClass);
+      }
     }
   }
 }
@@ -570,6 +588,8 @@ function startJoining(rawIdOrLink) {
   net.role = 'guest';
   net.myPlayerKey = 'p2';
   net.active = true;
+  buildBoard(true); // guest always sees their own side (p2) at the bottom, like chess.com
+  fitBoard();
   setOnlineStatus('online-join-status', 'Connecting…', '');
   const peer = new Peer();
   net.peer = peer;
@@ -585,10 +605,12 @@ function startJoining(rawIdOrLink) {
 }
 
 function teardownNetworking() {
+  const wasFlipped = net.myPlayerKey === 'p2';
   if (net.conn) { try { net.conn.close(); } catch (e) { /* ignore */ } }
   if (net.peer) { try { net.peer.destroy(); } catch (e) { /* ignore */ } }
   net.active = false; net.role = null; net.myPlayerKey = null; net.peer = null; net.conn = null; net.connected = false;
   document.body.dataset.lockedSide = '';
+  if (wasFlipped) { buildBoard(false); fitBoard(); }
 }
 
 function setOnlineStatus(elId, text, cls) {
@@ -624,10 +646,22 @@ function updateOnlineUI() {
   }
 
   const guestActive = net.active && net.role === 'guest';
-  ['pause-btn', 'speed-select', 'reset-btn'].forEach((id) => {
+  ['pause-btn', 'reset-btn'].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = guestActive;
   });
+  updateSpeedLock();
+}
+
+// Speed is a pre-game choice, not something to nudge mid-match - a PVP opponent (local or
+// online) shouldn't be able to speed the game up or down on you once it's underway. CPU
+// practice games are exempt since there's no opponent to affect.
+function updateSpeedLock() {
+  const el = $('speed-select');
+  if (!el) return;
+  const guestActive = net.active && net.role === 'guest';
+  const lockedByMatch = state.started && !state.vsCpu;
+  el.disabled = guestActive || lockedByMatch;
 }
 
 /* ======================= DOM REFS ======================= */
@@ -836,12 +870,23 @@ function makeCellDom(extraClass) {
   return el;
 }
 
-function buildBoard() {
+// `flip` mirrors the whole board (both row order and column order) so whoever's sitting at
+// THIS browser always sees their own side at the bottom, nearest their own player card - like
+// chess.com always showing your own pieces at the bottom regardless of color. Only ever true
+// for an online guest (who controls p2, normally drawn at the top) - host, hotseat and CPU play
+// keep the original P2-top/P1-bottom layout untouched. Every cell keeps its logical
+// (playerKey, depth, col) identity and cellEls[] lookup either way - flip only changes which
+// physical grid-row/grid-column a cell's DOM element is placed at.
+function buildBoard(flip) {
   boardEl.innerHTML = '';
   cellEls.p1 = Array.from({ length: GRID_DEPTH }, () => new Array(GRID_COLS));
   cellEls.p2 = Array.from({ length: GRID_DEPTH }, () => new Array(GRID_COLS));
   coreCellEls.p1 = [];
   coreCellEls.p2 = [];
+
+  const TOTAL_ROWS = 2 * GRID_DEPTH + NEUTRAL_ROWS + 2;
+  const rowLine = (logicalRow) => (flip ? TOTAL_ROWS - logicalRow + 1 : logicalRow);
+  const colLine = (col) => (flip ? GRID_COLS - col : col + 1);
 
   // Every cell gets an EXPLICIT grid-row/grid-column. Mixing explicit placement (the core
   // labels, which span the full row width) with implicit auto-placement (plain cells with no
@@ -849,11 +894,11 @@ function buildBoard() {
   // items first, so auto-placed cells skip around whatever row the labels reserved, and
   // everything after it silently shifts down by a row. Explicit placement for every cell
   // sidesteps that entirely.
-  let gridRow = 1; // CSS grid lines are 1-indexed
+  let gridRow = 1; // logical row, 1-indexed - see rowLine() for the actual CSS grid-row
 
   const placeCell = (el, col) => {
-    el.style.gridRow = String(gridRow);
-    el.style.gridColumn = String(col + 1);
+    el.style.gridRow = String(rowLine(gridRow));
+    el.style.gridColumn = String(colLine(col));
     boardEl.appendChild(el);
   };
 
@@ -920,21 +965,24 @@ function buildBoard() {
   // Core HP labels, explicitly grid-placed to span the full width of their row
   coreLabelEls.p2 = document.createElement('div');
   coreLabelEls.p2.className = 'core-label';
-  coreLabelEls.p2.style.gridRow = '1';
+  coreLabelEls.p2.style.gridRow = String(rowLine(1));
   coreLabelEls.p2.style.gridColumn = `1 / -1`;
   boardEl.appendChild(coreLabelEls.p2);
 
   coreLabelEls.p1 = document.createElement('div');
   coreLabelEls.p1.className = 'core-label';
-  coreLabelEls.p1.style.gridRow = String(totalRows);
+  coreLabelEls.p1.style.gridRow = String(rowLine(totalRows));
   coreLabelEls.p1.style.gridColumn = `1 / -1`;
   boardEl.appendChild(coreLabelEls.p1);
 
-  // Neutral zone label, spanning all of its rows
+  // Neutral zone label, spanning all of its rows - flip reverses which logical row maps to the
+  // top, so the span's start/end swap too (see rowLine()'s comment on buildBoard).
   const neutralLabel = document.createElement('div');
   neutralLabel.className = 'neutral-label';
   neutralLabel.textContent = 'NEUTRAL ZONE';
-  neutralLabel.style.gridRow = `${neutralStartRow} / ${neutralEndRow + 1}`;
+  neutralLabel.style.gridRow = flip
+    ? `${rowLine(neutralEndRow)} / ${rowLine(neutralStartRow) + 1}`
+    : `${neutralStartRow} / ${neutralEndRow + 1}`;
   neutralLabel.style.gridColumn = `1 / -1`;
   boardEl.appendChild(neutralLabel);
 
@@ -1777,6 +1825,7 @@ function tickPlayer(playerKey, dt) {
           const cellEl = cellEls[playerKey][d][c].root;
           spawnFloatText(cellEl, `+${genCfg.energyRate}⚡`, 'fx-energy');
           pulseCell(cellEl, 'pulse-energy');
+          netFx(playerKey, d, c, `+${genCfg.energyRate}⚡`, 'fx-energy', 'pulse-energy');
         }
       } else if (cell.type === 'storage') {
         capacity += TILE_TYPES.storage.tiers[cell.tier - 1].capacityBonus;
@@ -1830,6 +1879,7 @@ function tickPlayer(playerKey, dt) {
           const cellEl = cellEls[playerKey][d][c].root;
           spawnFloatText(cellEl, `+${labCfg.researchRate.toFixed(1)}🔬`, 'fx-research');
           pulseCell(cellEl, 'pulse-research');
+          netFx(playerKey, d, c, `+${labCfg.researchRate.toFixed(1)}🔬`, 'fx-research', 'pulse-research');
         }
       }
 
@@ -1908,8 +1958,10 @@ function tickPlayer(playerKey, dt) {
             if (cell._repairFxT >= 1) {
               cell._repairFxT -= 1;
               const cellEl = cellEls[playerKey][d][c].root;
-              spawnFloatText(cellEl, `+${Math.round(cell._repairAcc)}❤`, 'fx-repair');
+              const repairText = `+${Math.round(cell._repairAcc)}❤`;
+              spawnFloatText(cellEl, repairText, 'fx-repair');
               pulseCell(cellEl, 'pulse-repair');
+              netFx(playerKey, d, c, repairText, 'fx-repair', 'pulse-repair');
               cell._repairAcc = 0;
             }
           }
@@ -3507,6 +3559,7 @@ function beginCountdown() {
         countdownEl.classList.add('hidden');
         state.started = true;
         state.lastTime = null;
+        updateSpeedLock();
       }, 600);
     }
   };
@@ -3529,7 +3582,10 @@ $('pause-btn').addEventListener('click', () => {
 });
 
 $('speed-select').addEventListener('change', (e) => {
-  if (net.active && net.role === 'guest') return; // host-only control online
+  if ((net.active && net.role === 'guest') || (state.started && !state.vsCpu)) {
+    e.target.value = String(state.speed); // shouldn't fire while disabled, but don't trust it blindly
+    return;
+  }
   state.speed = parseFloat(e.target.value);
 });
 
